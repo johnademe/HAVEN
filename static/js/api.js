@@ -1,6 +1,11 @@
 // api.js — Fetch wrapper + shared app state
 
-const API = window.location.origin + '/api';
+// Compute base path so API calls work at subpath (e.g. /haven/)
+// e.g. URL = https://www.jtech.et/haven/  →  BASE_PATH = /haven
+// e.g. URL = https://www.jtech.et/haven   →  BASE_PATH = /haven
+// e.g. URL = https://www.jtech.et/        →  BASE_PATH = ''
+const BASE_PATH = window.location.pathname.replace(/\/$/, '');
+const API = window.location.origin + BASE_PATH + '/api';
 
 // Shared state (global to all modules)
 const AppState = {
