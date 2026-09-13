@@ -106,3 +106,72 @@ def check_auth():
             "company_id": session.get('company_id')
         })
     return jsonify({"authenticated": False})
+
+@auth_bp.route('/api/register', methods=['POST'])
+def register():
+    try:
+        data = request.json
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
+        full_name = (data.get('full_name') or '').strip()
+        email = (data.get('email') or '').strip()
+        company_name = (data.get('company_name') or '').strip()
+
+        if not username or not password:
+            return jsonify({"error": "Username and password are required"}), 400
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+        if not company_name:
+            return jsonify({"error": "Company name is required"}), 400
+
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Check if username already taken
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+        if cur.fetchone():
+            conn.close()
+            return jsonify({"error": "Username already exists"}), 409
+
+        # Create user
+        cur.execute("""
+            INSERT INTO users (username, password, full_name, email)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, username, full_name
+        """, (username, password, full_name, email))
+        user = cur.fetchone()
+
+        # Create company for this user
+        cur.execute("""
+            INSERT INTO companies (company_name, created_by)
+            VALUES (%s, %s)
+            RETURNING id, company_name
+        """, (company_name, user['id']))
+        company = cur.fetchone()
+
+        # Link user to their company
+        cur.execute("""
+            INSERT INTO user_companies (user_id, company_id, role)
+            VALUES (%s, %s, 'admin')
+        """, (user['id'], company['id']))
+
+        conn.commit()
+        conn.close()
+
+        # Auto-login: set session
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        session['full_name'] = user.get('full_name') or user['username']
+        session['company_id'] = company['id']
+        session['company_name'] = company['company_name']
+
+        return jsonify({
+            "success": True,
+            "user": user['username'],
+            "full_name": session['full_name'],
+            "company": company['company_name'],
+            "company_id": company['id']
+        })
+    except Exception as e:
+        print(f"Register error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
