@@ -11,10 +11,10 @@
     <script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.js"></script>
 
     <!-- App styles -->
-    <link rel="stylesheet" href="static/css/base.css">
-    <link rel="stylesheet" href="static/css/layout.css">
-    <link rel="stylesheet" href="static/css/components.css">
-    <link rel="stylesheet" href="static/css/calendar.css">
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/layout.css">
+    <link rel="stylesheet" href="/static/css/components.css">
+    <link rel="stylesheet" href="/static/css/calendar.css">
 </head>
 <body>
 
@@ -42,7 +42,7 @@
         </div>
     </div>
 
-    <!-- ═══ APP here ═══ -->
+    <!-- ═══ APP ═══ -->
     <div id="appPage">
         <div id="sidebarOverlay" class="sidebar-overlay" onclick="closeSidebar()"></div>
 
@@ -431,17 +431,17 @@
         </div>
     </div>
 
-    <!-- ═══ SCRIPTS (load order matter) ═══ -->
-    <script src="static/js/api.js"></script>
-    <script src="static/js/navigation.js"></script>
-    <script src="static/js/autocomplete.js"></script>
-    <script src="static/js/dashboard.js"></script>
-    <script src="static/js/sales.js"></script>
-    <script src="static/js/expenses.js"></script>
-    <script src="static/js/credits.js"></script>
-    <script src="static/js/reports.js"></script>
-    <script src="static/js/calendar.js"></script>
-    <script src="static/js/auth.js"></script>
-    <script src="static/js/main.js"></script>
+    <!-- ═══ SCRIPTS (load order matters!) ═══ -->
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/navigation.js"></script>
+    <script src="/static/js/autocomplete.js"></script>
+    <script src="/static/js/dashboard.js"></script>
+    <script src="/static/js/sales.js"></script>
+    <script src="/static/js/expenses.js"></script>
+    <script src="/static/js/credits.js"></script>
+    <script src="/static/js/reports.js"></script>
+    <script src="/static/js/calendar.js"></script>
+    <script src="/static/js/auth.js"></script>
+    <script src="/static/js/main.js"></script>
 </body>
 </html>
