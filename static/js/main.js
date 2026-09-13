@@ -26,11 +26,14 @@ function closeDeleteModal() {
 }
 
 // ─── INIT ───
+
+
 document.addEventListener('DOMContentLoaded', () => {
-    // Bind forms
     bindLoginForm();
+    bindRegisterForm();      
     bindSaleForm();
     bindExpenseForm();
+
 
     // Close modals on overlay click
     ['saleModal', 'expenseModal', 'deleteModal'].forEach(id => {
