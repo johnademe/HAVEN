@@ -1,0 +1,302 @@
+from flask import Flask, request, jsonify
+import psycopg2
+from datetime import datetime, timedelta
+from psycopg2.extras import RealDictCursor
+
+app = Flask(__name__)
+
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'revenue_db',
+    'user': 'haven',
+    'password': 'haven'
+}
+
+def get_db():
+    return psycopg2.connect(**DB_CONFIG)
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "Revenue API",
+        "endpoints": [
+            "/api/revenue/today",
+            "/api/revenue/week",
+            "/api/revenue/month",
+            "/api/sale",
+            "/api/items",
+            "/api/recent"
+        ]
+    })
+
+@app.route('/api/revenue/today')
+def today():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT COALESCE(SUM(total),0) as total, COALESCE(SUM(credit),0) as credit FROM sales WHERE sale_date = CURRENT_DATE")
+    data = cur.fetchone()
+    cur.execute("SELECT id, item, quantity, price, total, credit, sale_date FROM sales WHERE sale_date = CURRENT_DATE ORDER BY id DESC")
+    data['sales'] = cur.fetchall()
+    conn.close()
+    data['net'] = data['total'] - data['credit']
+    return jsonify(data)
+
+@app.route('/api/revenue/week')
+def week():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT COALESCE(SUM(total),0) as total, COALESCE(SUM(credit),0) as credit, COUNT(*) as transactions FROM sales WHERE sale_date >= CURRENT_DATE - INTERVAL '7 days'")
+    data = cur.fetchone()
+    cur.execute("SELECT id, item, quantity, price, total, credit, sale_date FROM sales WHERE sale_date >= CURRENT_DATE - INTERVAL '7 days' ORDER BY sale_date DESC")
+    data['sales'] = cur.fetchall()
+    conn.close()
+    data['net'] = data['total'] - data['credit']
+    return jsonify(data)
+
+@app.route('/api/revenue/month')
+def month():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT COALESCE(SUM(total),0) as total, COALESCE(SUM(credit),0) as credit, COUNT(*) as transactions FROM sales WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE)")
+    data = cur.fetchone()
+    cur.execute("SELECT id, item, quantity, price, total, credit, sale_date FROM sales WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE) ORDER BY sale_date DESC")
+    data['sales'] = cur.fetchall()
+    conn.close()
+    data['net'] = data['total'] - data['credit']
+    return jsonify(data)
+
+@app.route('/api/recent')
+def recent():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT id, item, quantity, price, total, credit, sale_date FROM sales ORDER BY id DESC LIMIT 20")
+    data = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/sale', methods=['POST'])
+def add_sale():
+    data = request.json
+    conn = get_db()
+    cur = conn.cursor()
+    total = data['quantity'] * data['price']
+    cur.execute("""
+        INSERT INTO sales (item, quantity, price, total, credit, sale_date)
+        VALUES (%s, %s, %s, %s, %s, COALESCE(%s, CURRENT_DATE))
+        RETURNING id
+    """, (data['item'], data['quantity'], data['price'], total, data.get('credit', 0), data.get('sale_date')))
+    sale_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO items (item_name, default_price, usage_count, last_used)
+        VALUES (%s, %s, 1, CURRENT_DATE)
+        ON CONFLICT (item_name) DO UPDATE SET
+            usage_count = items.usage_count + 1,
+            default_price = COALESCE(EXCLUDED.default_price, items.default_price),
+            last_used = CURRENT_DATE
+    """, (data['item'], data['price']))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"id": sale_id, "total": total})
+
+@app.route('/api/sale/<int:sale_id>', methods=['PUT', 'DELETE'])
+def update_sale(sale_id):
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == 'DELETE':
+        cur.execute("DELETE FROM sales WHERE id = %s RETURNING id", (sale_id,))
+        deleted = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if deleted:
+            return jsonify({"status": "deleted"})
+        return jsonify({"error": "Not found"}), 404
+
+    # PUT - Update
+    data = request.json
+    total = data['quantity'] * data['price']
+    cur.execute("""
+        UPDATE sales
+        SET item = %s, quantity = %s, price = %s, total = %s, credit = %s, sale_date = %s
+        WHERE id = %s RETURNING id
+    """, (data['item'], data['quantity'], data['price'], total, data.get('credit', 0), data.get('sale_date'), sale_id))
+
+    updated = cur.fetchone()
+    conn.commit()
+    conn.close()
+
+    if updated:
+        return jsonify({"status": "updated", "id": sale_id, "total": total})
+    return jsonify({"error": "Not found"}), 404
+
+@app.route('/api/items', methods=['GET', 'POST'])
+def items():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    if request.method == 'POST':
+        data = request.json
+        cur.execute("""
+            INSERT INTO items (item_name, default_price)
+            VALUES (%s, %s)
+            ON CONFLICT (item_name) DO UPDATE SET default_price = EXCLUDED.default_price
+        """, (data['item_name'], data.get('default_price', 0)))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "created"})
+
+    cur.execute("SELECT item_name, default_price, usage_count FROM items ORDER BY usage_count DESC, last_used DESC LIMIT 100")
+    data = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
+
+@app.route('/api/revenue/date/summary')
+def date_summary():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Summary by item
+    cur.execute("""
+        SELECT 
+            item,
+            COUNT(*) as transactions,
+            SUM(quantity) as total_quantity,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales 
+        WHERE sale_date = %s 
+        GROUP BY item 
+        ORDER BY total_revenue DESC
+    """, (date,))
+    summary = cur.fetchall()
+    
+    # Overall totals
+    cur.execute("""
+        SELECT 
+            COUNT(*) as total_transactions,
+            SUM(quantity) as total_items_sold,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales 
+        WHERE sale_date = %s
+    """, (date,))
+    totals = cur.fetchone()
+    
+    conn.close()
+    return jsonify({
+        "date": date,
+        "summary": summary,
+        "totals": totals
+    })
+
+@app.route('/api/revenue/date')
+def date_revenue():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT COALESCE(SUM(total),0) as total, COALESCE(SUM(credit),0) as credit FROM sales WHERE sale_date = %s", (date,))
+    data = cur.fetchone()
+    cur.execute("SELECT id, item, quantity, price, total, credit, sale_date FROM sales WHERE sale_date = %s ORDER BY id DESC", (date,))
+    data['sales'] = cur.fetchall()
+    conn.close()
+    data['net'] = data['total'] - data['credit']
+    return jsonify(data)
+
+@app.route('/api/revenue/date/summary')
+def date_summary():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cur.execute("""
+        SELECT 
+            item,
+            COUNT(*) as transactions,
+            SUM(quantity) as total_quantity,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales 
+        WHERE sale_date = %s 
+        GROUP BY item 
+        ORDER BY total_revenue DESC
+    """, (date,))
+    summary = cur.fetchall()
+    
+    cur.execute("""
+        SELECT 
+            COUNT(*) as total_transactions,
+            SUM(quantity) as total_items_sold,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales 
+        WHERE sale_date = %s
+    """, (date,))
+    totals = cur.fetchone()
+    
+    conn.close()
+    return jsonify({
+        "date": date,
+        "summary": summary,
+        "totals": totals
+    })
+
+@app.route('/api/revenue/date')
+def date_revenue():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT COALESCE(SUM(total),0) as total, COALESCE(SUM(credit),0) as credit FROM sales WHERE sale_date = %s", (date,))
+    data = cur.fetchone()
+    cur.execute("SELECT id, item, quantity, price, total, credit, sale_date FROM sales WHERE sale_date = %s ORDER BY id DESC", (date,))
+    data['sales'] = cur.fetchall()
+    conn.close()
+    data['net'] = data['total'] - data['credit']
+    return jsonify(data)
+
+@app.route('/api/revenue/date/summary')
+def date_summary():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT 
+            item,
+            COUNT(*) as transactions,
+            SUM(quantity) as total_quantity,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales 
+        WHERE sale_date = %s 
+        GROUP BY item 
+        ORDER BY total_revenue DESC
+    """, (date,))
+    summary = cur.fetchall()
+    cur.execute("""
+        SELECT 
+            COUNT(*) as total_transactions,
+            SUM(quantity) as total_items_sold,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales 
+        WHERE sale_date = %s
+    """, (date,))
+    totals = cur.fetchone()
+    conn.close()
+    return jsonify({
+        "date": date,
+        "summary": summary,
+        "totals": totals
+    })

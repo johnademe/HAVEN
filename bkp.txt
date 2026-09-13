@@ -1,0 +1,950 @@
+"""
+Daily/Weekly/Monthly Revenue Calculator - PostgreSQL Version
+Features: Item autocomplete, revenue reports, modern GUI
+"""
+
+import sys
+import psycopg2
+from psycopg2 import sql
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
+    QComboBox, QDateEdit, QTabWidget, QMessageBox, QGroupBox,
+    QHeaderView, QSpinBox, QDoubleSpinBox, QCompleter, QDialog,
+    QFormLayout, QDialogButtonBox
+)
+from PyQt5.QtCore import Qt, QDate, QStringListModel
+from PyQt5.QtGui import QFont, QColor
+
+# ==================== Database Configuration ====================
+# Update these with your PostgreSQL credentials
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'revenue_db',
+    'user': 'haven',
+    'password': 'haven'
+}
+
+def get_db_connection():
+    """Create and return a PostgreSQL database connection"""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        return None
+
+def init_db():
+    """Initialize database tables if they don't exist"""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    
+    cursor = conn.cursor()
+    
+    # Create sales table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sales (
+            id SERIAL PRIMARY KEY,
+            item VARCHAR(200) NOT NULL,
+            quantity INTEGER DEFAULT 1,
+            price DECIMAL(10,2) DEFAULT 0,
+            total DECIMAL(10,2) DEFAULT 0,
+            credit DECIMAL(10,2) DEFAULT 0,
+            sale_date DATE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create items table for autocomplete suggestions
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS items (
+            id SERIAL PRIMARY KEY,
+            item_name VARCHAR(200) UNIQUE NOT NULL,
+            default_price DECIMAL(10,2),
+            usage_count INTEGER DEFAULT 1,
+            last_used DATE
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    return True
+
+# ==================== Database Operations ====================
+class RevenueModel:
+    @staticmethod
+    def add_sale(item, quantity, price, credit=0, sale_date=None):
+        if sale_date is None:
+            sale_date = datetime.now().strftime("%Y-%m-%d")
+        
+        total = quantity * price
+        conn = get_db_connection()
+        if not conn:
+            return False
+        
+        cursor = conn.cursor()
+        
+        # Insert sale
+        cursor.execute('''
+            INSERT INTO sales (item, quantity, price, total, credit, sale_date)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+        ''', (item, quantity, price, total, credit, sale_date))
+        
+        sale_id = cursor.fetchone()[0]
+        
+        # Update or insert into items table for autocomplete
+        cursor.execute('''
+            INSERT INTO items (item_name, default_price, usage_count, last_used)
+            VALUES (%s, %s, 1, %s)
+            ON CONFLICT (item_name) 
+            DO UPDATE SET 
+                usage_count = items.usage_count + 1,
+                default_price = COALESCE(EXCLUDED.default_price, items.default_price),
+                last_used = EXCLUDED.last_used
+        ''', (item, price, sale_date))
+        
+        conn.commit()
+        conn.close()
+        return True
+
+    @staticmethod
+    def get_sales_by_period(start_date, end_date):
+        conn = get_db_connection()
+        if not conn:
+            return []
+        
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, item, quantity, price, total, credit, sale_date
+            FROM sales
+            WHERE sale_date BETWEEN %s AND %s
+            ORDER BY sale_date, id
+        ''', (start_date, end_date))
+        
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
+    @staticmethod
+    def get_all_sales():
+        conn = get_db_connection()
+        if not conn:
+            return []
+        
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, item, quantity, price, total, credit, sale_date 
+            FROM sales 
+            ORDER BY sale_date DESC, id DESC
+        ''')
+        
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
+    @staticmethod
+    def delete_sale(sale_id):
+        conn = get_db_connection()
+        if not conn:
+            return False
+        
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM sales WHERE id = %s', (sale_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    @staticmethod
+    def get_item_suggestions(search_text):
+        """Get item suggestions based on partial input"""
+        conn = get_db_connection()
+        if not conn:
+            return []
+        
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT item_name, default_price, usage_count
+            FROM items
+            WHERE item_name ILIKE %s
+            ORDER BY usage_count DESC, last_used DESC
+            LIMIT 15
+        ''', (f'%{search_text}%',))
+        
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
+    @staticmethod
+    def get_all_items():
+        """Get all items for autocomplete"""
+        conn = get_db_connection()
+        if not conn:
+            return []
+        
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT item_name, default_price
+            FROM items
+            ORDER BY usage_count DESC, last_used DESC
+        ''')
+        
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
+    @staticmethod
+    def get_item_price(item_name):
+        """Get default price for an item"""
+        conn = get_db_connection()
+        if not conn:
+            return None
+        
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT default_price FROM items WHERE item_name = %s
+        ''', (item_name,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+
+# ==================== Settings Dialog ====================
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Database Settings")
+        self.setModal(True)
+        layout = QFormLayout(self)
+        
+        self.host_input = QLineEdit(DB_CONFIG['host'])
+        self.port_input = QLineEdit(str(DB_CONFIG['port']))
+        self.db_input = QLineEdit(DB_CONFIG['database'])
+        self.user_input = QLineEdit(DB_CONFIG['user'])
+        self.password_input = QLineEdit(DB_CONFIG['password'])
+        self.password_input.setEchoMode(QLineEdit.Password)
+        
+        layout.addRow("Host:", self.host_input)
+        layout.addRow("Port:", self.port_input)
+        layout.addRow("Database:", self.db_input)
+        layout.addRow("Username:", self.user_input)
+        layout.addRow("Password:", self.password_input)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.save_settings)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+    
+    def save_settings(self):
+        global DB_CONFIG
+        DB_CONFIG.update({
+            'host': self.host_input.text(),
+            'port': int(self.port_input.text()),
+            'database': self.db_input.text(),
+            'user': self.user_input.text(),
+            'password': self.password_input.text()
+        })
+        self.accept()
+
+# ==================== Main Window ====================
+class RevenueApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Revenue Calculator - PostgreSQL (with Auto-Complete)")
+        self.setMinimumSize(1300, 750)
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f0f2f5;
+            }
+            QTabWidget::pane {
+                border: 1px solid #d0d7de;
+                background-color: white;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                background-color: #e9ecef;
+                padding: 10px 25px;
+                margin-right: 3px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                font-weight: bold;
+            }
+            QTabBar::tab:selected {
+                background-color: #2ecc71;
+                color: white;
+            }
+            QPushButton {
+                background-color: #2ecc71;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #27ae60;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit {
+                padding: 8px;
+                border: 1px solid #d0d7de;
+                border-radius: 6px;
+                font-size: 13px;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border-color: #2ecc71;
+                outline: none;
+            }
+            QTableWidget {
+                alternate-background-color: #f8f9fa;
+                gridline-color: #e9ecef;
+                selection-background-color: #d4edda;
+            }
+            QHeaderView::section {
+                background-color: #2c3e50;
+                color: white;
+                padding: 10px;
+                font-weight: bold;
+                border: none;
+            }
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                border: 2px solid #e9ecef;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
+        
+        # Initialize database
+        if not init_db():
+            QMessageBox.critical(self, "Database Error", 
+                                "Could not connect to PostgreSQL.\n"
+                                "Please check your database settings in the Settings menu.")
+        
+        self.model = RevenueModel()
+        self.setup_ui()
+        self.load_autocomplete_items()
+    
+    def setup_ui(self):
+        # Menu bar
+        menubar = self.menuBar()
+        settings_menu = menubar.addMenu("⚙️ Settings")
+        db_action = settings_menu.addAction("Database Connection")
+        db_action.triggered.connect(self.show_settings)
+        
+        help_menu = menubar.addMenu("❓ Help")
+        help_action = help_menu.addAction("About")
+        help_action.triggered.connect(self.show_about)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Title with stats
+        title_layout = QHBoxLayout()
+        title_label = QLabel("📊 Revenue Management System")
+        title_font = QFont("Arial", 20, QFont.Bold)
+        title_label.setFont(title_font)
+        title_label.setStyleSheet("color: #2c3e50;")
+        title_layout.addWidget(title_label)
+        
+        self.stats_label = QLabel("Ready")
+        self.stats_label.setStyleSheet("color: #7f8c8d; font-size: 12px;")
+        title_layout.addWidget(self.stats_label, alignment=Qt.AlignRight)
+        main_layout.addLayout(title_layout)
+        
+        # Tab widget
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+        
+        # Create tabs
+        self.create_insert_tab()
+        self.create_revenue_tab()
+        self.create_all_sales_tab()
+        self.create_items_tab()
+        
+        self.update_stats()
+    
+    def load_autocomplete_items(self):
+        """Load all items for the completer"""
+        items = self.model.get_all_items()
+        item_names = [item[0] for item in items]
+        
+        # Setup completer
+        self.completer = QCompleter(item_names)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchContains)
+        self.item_input.setCompleter(self.completer)
+    
+    def update_stats(self):
+        """Update statistics label"""
+        total_sales = len(self.model.get_all_sales())
+        items_count = len(self.model.get_all_items())
+        self.stats_label.setText(f"📦 Total Sales: {total_sales} | 🏷️ Unique Items: {items_count}")
+    
+    # ==================== Insert Tab with Auto-Complete ====================
+    def create_insert_tab(self):
+        insert_tab = QWidget()
+        layout = QVBoxLayout(insert_tab)
+        
+        # Quick add section
+        quick_group = QGroupBox("Quick Add / Auto-Complete")
+        quick_layout = QVBoxLayout()
+        
+        # Item with autocomplete
+        item_layout = QHBoxLayout()
+        item_layout.addWidget(QLabel("Item Name:"))
+        self.item_input = QLineEdit()
+        self.item_input.setPlaceholderText("Start typing... items will auto-suggest")
+        self.item_input.textChanged.connect(self.on_item_text_changed)
+        self.item_input.returnPressed.connect(self.auto_fill_price)
+        item_layout.addWidget(self.item_input)
+        
+        self.suggest_button = QPushButton("🔍 Browse Items")
+        self.suggest_button.clicked.connect(self.show_item_browser)
+        item_layout.addWidget(self.suggest_button)
+        quick_layout.addLayout(item_layout)
+        
+        # Quick stats for selected item
+        self.item_info_label = QLabel("💡 Tip: Start typing an item name to see suggestions")
+        self.item_info_label.setStyleSheet("color: #3498db; font-size: 11px; padding: 5px;")
+        quick_layout.addWidget(self.item_info_label)
+        
+        # Quantity & Price
+        qty_price_layout = QHBoxLayout()
+        qty_price_layout.addWidget(QLabel("Quantity:"))
+        self.qty_input = QSpinBox()
+        self.qty_input.setMinimum(1)
+        self.qty_input.setMaximum(9999)
+        self.qty_input.valueChanged.connect(self.update_total_preview)
+        qty_price_layout.addWidget(self.qty_input)
+        qty_price_layout.addSpacing(30)
+        qty_price_layout.addWidget(QLabel("Price ($):"))
+        self.price_input = QDoubleSpinBox()
+        self.price_input.setMinimum(0)
+        self.price_input.setMaximum(99999)
+        self.price_input.setDecimals(2)
+        self.price_input.setPrefix("$")
+        self.price_input.valueChanged.connect(self.update_total_preview)
+        qty_price_layout.addWidget(self.price_input)
+        quick_layout.addLayout(qty_price_layout)
+        
+        # Total preview
+        self.total_preview_label = QLabel("Total: $0.00")
+        self.total_preview_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.total_preview_label.setStyleSheet("color: #27ae60;")
+        quick_layout.addWidget(self.total_preview_label)
+        
+        # Credit and Date
+        credit_layout = QHBoxLayout()
+        credit_layout.addWidget(QLabel("Credit ($):"))
+        self.credit_input = QDoubleSpinBox()
+        self.credit_input.setMinimum(0)
+        self.credit_input.setMaximum(99999)
+        self.credit_input.setDecimals(2)
+        self.credit_input.setPrefix("$")
+        credit_layout.addWidget(self.credit_input)
+        credit_layout.addSpacing(30)
+        credit_layout.addWidget(QLabel("Sale Date:"))
+        self.date_input = QDateEdit()
+        self.date_input.setDate(QDate.currentDate())
+        self.date_input.setCalendarPopup(True)
+        credit_layout.addWidget(self.date_input)
+        quick_layout.addLayout(credit_layout)
+        
+        # Add button
+        self.add_button = QPushButton("✅ Add Sale")
+        self.add_button.clicked.connect(self.add_sale)
+        self.add_button.setStyleSheet("background-color: #27ae60; padding: 12px; font-size: 14px;")
+        quick_layout.addWidget(self.add_button)
+        
+        quick_group.setLayout(quick_layout)
+        layout.addWidget(quick_group)
+        
+        # Popular items section
+        popular_group = QGroupBox("🔥 Popular Items")
+        popular_layout = QVBoxLayout()
+        self.popular_items_layout = QHBoxLayout()
+        self.load_popular_items()
+        popular_layout.addLayout(self.popular_items_layout)
+        popular_group.setLayout(popular_layout)
+        layout.addWidget(popular_group)
+        
+        # Recent sales preview
+        preview_group = QGroupBox("Recent Sales")
+        preview_layout = QVBoxLayout()
+        self.preview_table = QTableWidget()
+        self.preview_table.setAlternatingRowColors(True)
+        preview_layout.addWidget(self.preview_table)
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        
+        layout.addStretch()
+        self.tabs.addTab(insert_tab, "➕ Quick Add")
+        self.refresh_preview()
+    
+    def load_popular_items(self):
+        """Load popular items as quick buttons"""
+        # Clear existing buttons
+        for i in reversed(range(self.popular_items_layout.count())):
+            widget = self.popular_items_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
+        
+        items = self.model.get_all_items()[:8]  # Top 8 items
+        for item_name, price in items:
+            btn = QPushButton(f"{item_name}\n(${price:.2f})")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #f8f9fa;
+                    color: #2c3e50;
+                    border: 1px solid #dee2e6;
+                    padding: 8px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #e9ecef;
+                    border-color: #2ecc71;
+                }
+            """)
+            btn.clicked.connect(lambda checked, i=item_name, p=price: self.select_item(i, p))
+            self.popular_items_layout.addWidget(btn)
+    
+    def select_item(self, item_name, price):
+        """Select an item from popular buttons"""
+        self.item_input.setText(item_name)
+        self.price_input.setValue(price)
+        self.update_total_preview()
+        self.item_input.setFocus()
+    
+    def on_item_text_changed(self, text):
+        """Handle item text changes - show suggestions"""
+        if len(text) >= 2:
+            suggestions = self.model.get_item_suggestions(text)
+            if suggestions:
+                self.item_info_label.setText(f"💡 Found {len(suggestions)} matching items. Press Enter to auto-fill price.")
+            else:
+                self.item_info_label.setText("💡 New item - price will be saved for future use")
+        else:
+            self.item_info_label.setText("💡 Type at least 2 characters for suggestions")
+    
+    def auto_fill_price(self):
+        """Auto-fill price when Enter is pressed"""
+        item_name = self.item_input.text().strip()
+        if item_name:
+            price = self.model.get_item_price(item_name)
+            if price is not None:
+                self.price_input.setValue(price)
+                self.item_info_label.setText(f"✅ Auto-filled price: ${price:.2f}")
+            else:
+                self.item_info_label.setText("📝 New item - enter price and it will be saved")
+    
+    def show_item_browser(self):
+        """Show dialog to browse and select items"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Browse Items")
+        dialog.setMinimumSize(400, 500)
+        layout = QVBoxLayout(dialog)
+        
+        search_box = QLineEdit()
+        search_box.setPlaceholderText("Search items...")
+        layout.addWidget(search_box)
+        
+        items_list = QTableWidget()
+        items_list.setColumnCount(2)
+        items_list.setHorizontalHeaderLabels(["Item Name", "Default Price"])
+        
+        def refresh_items():
+            items = self.model.get_all_items()
+            search_text = search_box.text().lower()
+            if search_text:
+                items = [i for i in items if search_text in i[0].lower()]
+            
+            items_list.setRowCount(len(items))
+            for row, (name, price) in enumerate(items):
+                items_list.setItem(row, 0, QTableWidgetItem(name))
+                items_list.setItem(row, 1, QTableWidgetItem(f"${price:.2f}" if price else "-"))
+        
+        search_box.textChanged.connect(refresh_items)
+        refresh_items()
+        
+        items_list.itemDoubleClicked.connect(lambda item: self.select_from_browser(items_list, dialog))
+        
+        layout.addWidget(items_list)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.exec_()
+    
+    def select_from_browser(self, items_list, dialog):
+        row = items_list.currentRow()
+        if row >= 0:
+            item_name = items_list.item(row, 0).text()
+            price_text = items_list.item(row, 1).text().replace('$', '')
+            if price_text != '-':
+                self.item_input.setText(item_name)
+                self.price_input.setValue(float(price_text))
+                dialog.accept()
+    
+    def update_total_preview(self):
+        total = self.qty_input.value() * self.price_input.value()
+        self.total_preview_label.setText(f"💰 Total: ${total:.2f}")
+    
+    def add_sale(self):
+        item = self.item_input.text().strip()
+        if not item:
+            QMessageBox.warning(self, "Input Error", "Please enter an item name.")
+            return
+        
+        quantity = self.qty_input.value()
+        price = self.price_input.value()
+        credit = self.credit_input.value()
+        sale_date = self.date_input.date().toString("yyyy-MM-dd")
+        
+        if self.model.add_sale(item, quantity, price, credit, sale_date):
+            QMessageBox.information(self, "Success", 
+                                   f"✅ Sale added successfully!\n\n"
+                                   f"Item: {item}\n"
+                                   f"Quantity: {quantity}\n"
+                                   f"Price: ${price:.2f}\n"
+                                   f"Total: ${quantity * price:.2f}")
+            
+            # Clear inputs (keep item for quick consecutive entries)
+            self.qty_input.setValue(1)
+            self.price_input.setValue(0)
+            self.credit_input.setValue(0)
+            self.date_input.setDate(QDate.currentDate())
+            self.item_input.setFocus()
+            self.item_input.selectAll()
+            
+            self.refresh_preview()
+            self.refresh_all_sales()
+            self.load_popular_items()
+            self.load_autocomplete_items()
+            self.update_stats()
+        else:
+            QMessageBox.critical(self, "Database Error", "Failed to add sale. Please check database connection.")
+    
+    def refresh_preview(self):
+        sales = self.model.get_all_sales()
+        self.preview_table.setRowCount(min(10, len(sales)))
+        self.preview_table.setColumnCount(6)
+        self.preview_table.setHorizontalHeaderLabels(["ID", "Item", "Qty", "Price", "Total", "Date"])
+        
+        for row, sale in enumerate(sales[:10]):
+            self.preview_table.setItem(row, 0, QTableWidgetItem(str(sale[0])))
+            self.preview_table.setItem(row, 1, QTableWidgetItem(sale[1]))
+            self.preview_table.setItem(row, 2, QTableWidgetItem(str(sale[2])))
+            self.preview_table.setItem(row, 3, QTableWidgetItem(f"${sale[3]:.2f}"))
+            self.preview_table.setItem(row, 4, QTableWidgetItem(f"${sale[4]:.2f}"))
+            self.preview_table.setItem(row, 5, QTableWidgetItem(str(sale[6])))
+        
+        self.preview_table.resizeColumnsToContents()
+    
+    # ==================== Revenue Tab ====================
+    def create_revenue_tab(self):
+        revenue_tab = QWidget()
+        layout = QVBoxLayout(revenue_tab)
+        
+        # Period selection
+        period_group = QGroupBox("📅 Period Selection")
+        period_layout = QHBoxLayout()
+        
+        period_layout.addWidget(QLabel("Report Type:"))
+        self.period_combo = QComboBox()
+        self.period_combo.addItems(["Daily", "Weekly", "Monthly", "Quarterly", "Yearly", "Custom Range"])
+        self.period_combo.currentIndexChanged.connect(self.on_period_changed)
+        period_layout.addWidget(self.period_combo)
+        
+        self.custom_widgets = QWidget()
+        custom_layout = QHBoxLayout()
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+        custom_layout.addWidget(QLabel("From:"))
+        self.start_date = QDateEdit()
+        self.start_date.setDate(QDate.currentDate().addDays(-30))
+        self.start_date.setCalendarPopup(True)
+        custom_layout.addWidget(self.start_date)
+        custom_layout.addWidget(QLabel("To:"))
+        self.end_date = QDateEdit()
+        self.end_date.setDate(QDate.currentDate())
+        self.end_date.setCalendarPopup(True)
+        custom_layout.addWidget(self.end_date)
+        self.custom_widgets.setLayout(custom_layout)
+        self.custom_widgets.setVisible(False)
+        period_layout.addWidget(self.custom_widgets)
+        
+        self.calc_button = QPushButton("📊 Calculate")
+        self.calc_button.clicked.connect(self.calculate_revenue)
+        period_layout.addWidget(self.calc_button)
+        
+        period_group.setLayout(period_layout)
+        layout.addWidget(period_group)
+        
+        # Summary cards
+        summary_group = QGroupBox("💰 Revenue Summary")
+        summary_layout = QHBoxLayout()
+        
+        self.total_revenue_label = QLabel("Total Revenue\n$0.00")
+        self.total_revenue_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.total_revenue_label.setAlignment(Qt.AlignCenter)
+        self.total_revenue_label.setStyleSheet("background-color: #d4edda; padding: 15px; border-radius: 8px; color: #155724;")
+        
+        self.total_credit_label = QLabel("Total Credit\n$0.00")
+        self.total_credit_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.total_credit_label.setAlignment(Qt.AlignCenter)
+        self.total_credit_label.setStyleSheet("background-color: #f8d7da; padding: 15px; border-radius: 8px; color: #721c24;")
+        
+        self.net_revenue_label = QLabel("Net Revenue\n$0.00")
+        self.net_revenue_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.net_revenue_label.setAlignment(Qt.AlignCenter)
+        self.net_revenue_label.setStyleSheet("background-color: #d1ecf1; padding: 15px; border-radius: 8px; color: #0c5460;")
+        
+        self.transaction_count_label = QLabel("Transactions\n0")
+        self.transaction_count_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.transaction_count_label.setAlignment(Qt.AlignCenter)
+        self.transaction_count_label.setStyleSheet("background-color: #fff3cd; padding: 15px; border-radius: 8px; color: #856404;")
+        
+        summary_layout.addWidget(self.total_revenue_label)
+        summary_layout.addWidget(self.total_credit_label)
+        summary_layout.addWidget(self.net_revenue_label)
+        summary_layout.addWidget(self.transaction_count_label)
+        summary_group.setLayout(summary_layout)
+        layout.addWidget(summary_group)
+        
+        # Sales table
+        table_group = QGroupBox("📋 Transaction Details")
+        table_layout = QVBoxLayout()
+        self.revenue_table = QTableWidget()
+        self.revenue_table.setAlternatingRowColors(True)
+        self.revenue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        table_layout.addWidget(self.revenue_table)
+        table_group.setLayout(table_layout)
+        layout.addWidget(table_group)
+        
+        # Delete button
+        self.delete_button = QPushButton("🗑️ Delete Selected Transaction")
+        self.delete_button.clicked.connect(self.delete_selected_sale)
+        self.delete_button.setStyleSheet("background-color: #e74c3c;")
+        layout.addWidget(self.delete_button)
+        
+        self.tabs.addTab(revenue_tab, "💰 Revenue Reports")
+    
+    def on_period_changed(self):
+        is_custom = self.period_combo.currentText() == "Custom Range"
+        self.custom_widgets.setVisible(is_custom)
+    
+    def calculate_revenue(self):
+        period = self.period_combo.currentText()
+        today = QDate.currentDate()
+        
+        if period == "Daily":
+            start = today.toString("yyyy-MM-dd")
+            end = start
+        elif period == "Weekly":
+            start_date = today.addDays(-today.dayOfWeek())
+            start = start_date.toString("yyyy-MM-dd")
+            end = today.toString("yyyy-MM-dd")
+        elif period == "Monthly":
+            start = QDate(today.year(), today.month(), 1).toString("yyyy-MM-dd")
+            end = today.toString("yyyy-MM-dd")
+        elif period == "Quarterly":
+            quarter_month = ((today.month() - 1) // 3) * 3 + 1
+            start = QDate(today.year(), quarter_month, 1).toString("yyyy-MM-dd")
+            end = today.toString("yyyy-MM-dd")
+        elif period == "Yearly":
+            start = QDate(today.year(), 1, 1).toString("yyyy-MM-dd")
+            end = today.toString("yyyy-MM-dd")
+        else:  # Custom
+            start = self.start_date.date().toString("yyyy-MM-dd")
+            end = self.end_date.date().toString("yyyy-MM-dd")
+        
+        sales = self.model.get_sales_by_period(start, end)
+        
+        total_revenue = sum(sale[4] for sale in sales)
+        total_credit = sum(sale[5] for sale in sales)
+        net_revenue = total_revenue - total_credit
+        
+        self.total_revenue_label.setText(f"Total Revenue\n${total_revenue:,.2f}")
+        self.total_credit_label.setText(f"Total Credit\n${total_credit:,.2f}")
+        self.net_revenue_label.setText(f"Net Revenue\n${net_revenue:,.2f}")
+        self.transaction_count_label.setText(f"Transactions\n{len(sales)}")
+        
+        # Populate table
+        self.revenue_table.setRowCount(len(sales))
+        self.revenue_table.setColumnCount(7)
+        self.revenue_table.setHorizontalHeaderLabels(["ID", "Item", "Qty", "Price", "Total", "Credit", "Date"])
+        
+        for row, sale in enumerate(sales):
+            self.revenue_table.setItem(row, 0, QTableWidgetItem(str(sale[0])))
+            self.revenue_table.setItem(row, 1, QTableWidgetItem(sale[1]))
+            self.revenue_table.setItem(row, 2, QTableWidgetItem(str(sale[2])))
+            self.revenue_table.setItem(row, 3, QTableWidgetItem(f"${sale[3]:.2f}"))
+            self.revenue_table.setItem(row, 4, QTableWidgetItem(f"${sale[4]:.2f}"))
+            self.revenue_table.setItem(row, 5, QTableWidgetItem(f"${sale[5]:.2f}"))
+            self.revenue_table.setItem(row, 6, QTableWidgetItem(str(sale[6])))
+        
+        self.revenue_table.resizeColumnsToContents()
+    
+    def delete_selected_sale(self):
+        selected = self.revenue_table.currentRow()
+        if selected >= 0:
+            sale_id = int(self.revenue_table.item(selected, 0).text())
+            reply = QMessageBox.question(self, "Confirm Delete", 
+                                         "Are you sure you want to delete this transaction?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                if self.model.delete_sale(sale_id):
+                    QMessageBox.information(self, "Success", "Transaction deleted successfully.")
+                    self.calculate_revenue()
+                    self.refresh_preview()
+                    self.refresh_all_sales()
+                    self.load_popular_items()
+                    self.update_stats()
+                else:
+                    QMessageBox.critical(self, "Error", "Failed to delete transaction.")
+        else:
+            QMessageBox.warning(self, "Selection Error", "Please select a transaction to delete.")
+    
+    # ==================== All Sales Tab ====================
+    def create_all_sales_tab(self):
+        all_sales_tab = QWidget()
+        layout = QVBoxLayout(all_sales_tab)
+        
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("🔍 Search:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search by item name...")
+        self.search_input.textChanged.connect(self.filter_sales)
+        controls_layout.addWidget(self.search_input)
+        
+        self.refresh_all_button = QPushButton("🔄 Refresh")
+        self.refresh_all_button.clicked.connect(self.refresh_all_sales)
+        controls_layout.addWidget(self.refresh_all_button)
+        
+        layout.addLayout(controls_layout)
+        
+        self.all_sales_table = QTableWidget()
+        self.all_sales_table.setAlternatingRowColors(True)
+        layout.addWidget(self.all_sales_table)
+        
+        self.tabs.addTab(all_sales_tab, "📋 All Transactions")
+        self.refresh_all_sales()
+    
+    def refresh_all_sales(self):
+        sales = self.model.get_all_sales()
+        self.all_sales = sales
+        self.filter_sales()
+    
+    def filter_sales(self):
+        search_term = self.search_input.text().lower()
+        filtered = [s for s in self.all_sales if search_term in s[1].lower()] if search_term else self.all_sales
+        
+        self.all_sales_table.setRowCount(len(filtered))
+        self.all_sales_table.setColumnCount(7)
+        self.all_sales_table.setHorizontalHeaderLabels(["ID", "Item", "Qty", "Price", "Total", "Credit", "Date"])
+        
+        for row, sale in enumerate(filtered):
+            self.all_sales_table.setItem(row, 0, QTableWidgetItem(str(sale[0])))
+            self.all_sales_table.setItem(row, 1, QTableWidgetItem(sale[1]))
+            self.all_sales_table.setItem(row, 2, QTableWidgetItem(str(sale[2])))
+            self.all_sales_table.setItem(row, 3, QTableWidgetItem(f"${sale[3]:.2f}"))
+            self.all_sales_table.setItem(row, 4, QTableWidgetItem(f"${sale[4]:.2f}"))
+            self.all_sales_table.setItem(row, 5, QTableWidgetItem(f"${sale[5]:.2f}"))
+            self.all_sales_table.setItem(row, 6, QTableWidgetItem(str(sale[6])))
+        
+        self.all_sales_table.resizeColumnsToContents()
+    
+    # ==================== Items Management Tab ====================
+    def create_items_tab(self):
+        items_tab = QWidget()
+        layout = QVBoxLayout(items_tab)
+        
+        # Items table
+        self.items_table = QTableWidget()
+        self.items_table.setColumnCount(3)
+        self.items_table.setHorizontalHeaderLabels(["Item Name", "Default Price", "Times Used"])
+        self.items_table.setAlternatingRowColors(True)
+        layout.addWidget(self.items_table)
+        
+        # Refresh button
+        refresh_items_btn = QPushButton("🔄 Refresh Items List")
+        refresh_items_btn.clicked.connect(self.load_items_table)
+        layout.addWidget(refresh_items_btn)
+        
+        self.tabs.addTab(items_tab, "🏷️ Manage Items")
+        self.load_items_table()
+    
+    def load_items_table(self):
+        items = self.model.get_all_items()
+        self.items_table.setRowCount(len(items))
+        
+        for row, (name, price, count) in enumerate(items):
+            self.items_table.setItem(row, 0, QTableWidgetItem(name))
+            self.items_table.setItem(row, 1, QTableWidgetItem(f"${price:.2f}" if price else "-"))
+            self.items_table.setItem(row, 2, QTableWidgetItem(str(count) if count else "1"))
+        
+        self.items_table.resizeColumnsToContents()
+    
+    # ==================== Settings & Help ====================
+    def show_settings(self):
+        dialog = SettingsDialog(self)
+        if dialog.exec_():
+            # Reinitialize database with new settings
+            if init_db():
+                QMessageBox.information(self, "Success", "Database settings updated successfully!")
+                self.load_autocomplete_items()
+                self.refresh_all_sales()
+                self.load_popular_items()
+                self.update_stats()
+            else:
+                QMessageBox.critical(self, "Error", "Could not connect with new settings. Please check your credentials.")
+    
+    def show_about(self):
+        QMessageBox.about(self, "About Revenue Manager",
+                         "<h2>Revenue Management System</h2>"
+                         "<p>Version 2.0 (PostgreSQL)</p>"
+                         "<p>Features:</p>"
+                         "<ul>"
+                         "<li>Auto-complete item names from database</li>"
+                         "<li>Intelligent price suggestions</li>"
+                         "<li>Daily/Weekly/Monthly/Quarterly/Yearly reports</li>"
+                         "<li>Credit tracking and net revenue calculation</li>"
+                         "<li>Popular items quick-access buttons</li>"
+                         "<li>Search and filter capabilities</li>"
+                         "</ul>"
+                         "<p>Database: PostgreSQL</p>")
+
+# ==================== Run Application ====================
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    
+    # Check if psycopg2 is installed
+    try:
+        import psycopg2
+    except ImportError:
+        QMessageBox.critical(None, "Missing Dependency", 
+                            "Please install psycopg2:\n\npip install psycopg2-binary")
+        sys.exit(1)
+    
+    window = RevenueApp()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()

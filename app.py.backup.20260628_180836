@@ -1,0 +1,1238 @@
+from flask import Flask, request, jsonify, session
+import psycopg2
+from datetime import datetime, timedelta
+from psycopg2.extras import RealDictCursor
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+import secrets
+import re
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'revenue_db',
+    'user': 'haven',
+    'password': 'haven'
+}
+
+def get_db():
+    return psycopg2.connect(**DB_CONFIG)
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({"error": "Please login first"}), 401
+        if 'company_id' not in session:
+            return jsonify({"error": "Please select a company"}), 400
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/')
+def home():
+    if 'user_id' in session:
+        return jsonify({
+            "message": "Enhanced Revenue & Expense API",
+            "user": session.get('username'),
+            "company": session.get('company_name'),
+            "endpoints": {
+                "auth": ["/api/login", "/api/logout", "/api/check-auth"],
+                "companies": ["/api/companies", "/api/companies/<id>", "/api/switch-company"],
+                "revenue": [
+                    "/api/revenue/today",
+                    "/api/revenue/week",
+                    "/api/revenue/month",
+                    "/api/revenue/date",
+                    "/api/revenue/date/summary"
+                ],
+                "sales": ["/api/sale", "/api/sale/<id>", "/api/recent"],
+                "items": ["/api/items", "/api/items/<name>"],
+                "expenses": [
+                    "/api/expenses",
+                    "/api/expenses/today",
+                    "/api/expenses/week",
+                    "/api/expenses/month",
+                    "/api/expenses/date",
+                    "/api/expense"
+                ],
+                "credits": [
+                    "/api/credits/pending",
+                    "/api/credits/paid",
+                    "/api/credits/pay/<sale_id>"
+                ],
+                "reports": [
+                    "/api/reports/profit-loss",
+                    "/api/reports/summary",
+                    "/api/reports/company-performance"
+                ]
+            }
+        })
+    return jsonify({
+        "message": "Enhanced Revenue & Expense API",
+        "login_url": "/api/login",
+        "register_url": "/api/register"
+    })
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    email = data.get('email')
+    full_name = data.get('full_name', '')
+
+    if not username or not password or not email:
+        return jsonify({"error": "Username, password, and email required"}), 400
+
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        return jsonify({"error": "Invalid email format"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+    if cur.fetchone():
+        conn.close()
+        return jsonify({"error": "Username already exists"}), 400
+
+    cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+    if cur.fetchone():
+        conn.close()
+        return jsonify({"error": "Email already registered"}), 400
+
+    password_hash = generate_password_hash(password)
+    cur.execute("""
+        INSERT INTO users (username, password_hash, email, full_name, created_at)
+        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+        RETURNING id
+    """, (username, password_hash, email, full_name))
+    user_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    session['user_id'] = user_id
+    session['username'] = username
+
+    return jsonify({
+        "success": True,
+        "user": username,
+        "message": "Registration successful"
+    })
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    company_id = data.get('company_id')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT id, username, password_hash, full_name, email
+        FROM users WHERE username = %s
+    """, (username,))
+    user = cur.fetchone()
+
+    if not user:
+        conn.close()
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    if not check_password_hash(user['password_hash'], password):
+        conn.close()
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['full_name'] = user['full_name']
+
+    # Handle company selection
+    if company_id:
+        cur.execute("""
+            SELECT id, company_name FROM companies
+            WHERE id = %s AND id IN (
+                SELECT company_id FROM user_companies WHERE user_id = %s
+            )
+        """, (company_id, user['id']))
+        company = cur.fetchone()
+        if company:
+            session['company_id'] = company['id']
+            session['company_name'] = company['company_name']
+    else:
+        # Auto-assign first available company
+        cur.execute("""
+            SELECT c.id, c.company_name 
+            FROM companies c
+            JOIN user_companies uc ON c.id = uc.company_id
+            WHERE uc.user_id = %s
+            LIMIT 1
+        """, (user['id'],))
+        company = cur.fetchone()
+        if company:
+            session['company_id'] = company['id']
+            session['company_name'] = company['company_name']
+        else:
+            # Create default company for user
+            cur.execute("""
+                INSERT INTO companies (company_name, created_by)
+                VALUES (%s, %s)
+                RETURNING id, company_name
+            """, (f"{username}'s Company", user['id']))
+            company = cur.fetchone()
+            
+            cur.execute("""
+                INSERT INTO user_companies (user_id, company_id, role)
+                VALUES (%s, %s, 'admin')
+            """, (user['id'], company['id']))
+            conn.commit()
+            
+            session['company_id'] = company['id']
+            session['company_name'] = company['company_name']
+
+    conn.close()
+    return jsonify({
+        "success": True,
+        "user": username,
+        "company": session.get('company_name'),
+        "company_id": session.get('company_id'),
+        "message": "Login successful"
+    })
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({"success": True})
+
+@app.route('/api/check-auth')
+def check_auth():
+    if 'user_id' in session:
+        return jsonify({
+            "authenticated": True,
+            "user": session.get('username'),
+            "full_name": session.get('full_name'),
+            "company": session.get('company_name'),
+            "company_id": session.get('company_id')
+        })
+    return jsonify({"authenticated": False})
+
+# ==================== COMPANY MANAGEMENT ====================
+
+@app.route('/api/companies', methods=['GET', 'POST'])
+@login_required
+def companies():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    if request.method == 'POST':
+        data = request.json
+        company_name = data.get('company_name')
+        if not company_name:
+            return jsonify({"error": "Company name required"}), 400
+
+        cur.execute("""
+            INSERT INTO companies (company_name, created_by, created_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            RETURNING id
+        """, (company_name, session['user_id']))
+        company_id = cur.fetchone()['id']
+
+        cur.execute("""
+            INSERT INTO user_companies (user_id, company_id, role)
+            VALUES (%s, %s, 'admin')
+        """, (session['user_id'], company_id))
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "success": True,
+            "company_id": company_id,
+            "company_name": company_name
+        })
+
+    cur.execute("""
+        SELECT c.id, c.company_name, uc.role,
+               (SELECT COUNT(*) FROM user_companies WHERE company_id = c.id) as member_count,
+               (SELECT COUNT(*) FROM sales WHERE company_id = c.id) as total_sales,
+               (SELECT COALESCE(SUM(total - credit), 0) FROM sales WHERE company_id = c.id) as total_revenue
+        FROM companies c
+        JOIN user_companies uc ON c.id = uc.company_id
+        WHERE uc.user_id = %s
+        ORDER BY c.company_name
+    """, (session['user_id'],))
+    companies = cur.fetchall()
+    conn.close()
+    return jsonify(companies)
+
+@app.route('/api/companies/<int:company_id>', methods=['GET', 'PUT', 'DELETE'])
+@login_required
+def manage_company(company_id):
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT role FROM user_companies
+        WHERE user_id = %s AND company_id = %s
+    """, (session['user_id'], company_id))
+    user_company = cur.fetchone()
+
+    if not user_company:
+        conn.close()
+        return jsonify({"error": "Access denied"}), 403
+
+    if request.method == 'DELETE':
+        if user_company['role'] != 'admin':
+            conn.close()
+            return jsonify({"error": "Only admins can delete companies"}), 403
+
+        cur.execute("DELETE FROM companies WHERE id = %s RETURNING id", (company_id,))
+        deleted = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if deleted:
+            return jsonify({"success": True})
+        return jsonify({"error": "Company not found"}), 404
+
+    if request.method == 'PUT':
+        if user_company['role'] != 'admin':
+            conn.close()
+            return jsonify({"error": "Only admins can update company"}), 403
+
+        data = request.json
+        company_name = data.get('company_name')
+        if company_name:
+            cur.execute("""
+                UPDATE companies SET company_name = %s
+                WHERE id = %s RETURNING id
+            """, (company_name, company_id))
+            conn.commit()
+
+        user_id = data.get('user_id')
+        new_role = data.get('role')
+        if user_id and new_role in ['admin', 'member', 'viewer']:
+            cur.execute("""
+                UPDATE user_companies SET role = %s
+                WHERE user_id = %s AND company_id = %s
+            """, (new_role, user_id, company_id))
+            conn.commit()
+
+        conn.close()
+        return jsonify({"success": True})
+
+    cur.execute("""
+        SELECT c.*,
+               COUNT(DISTINCT uc.user_id) as member_count,
+               COUNT(DISTINCT s.id) as transaction_count
+        FROM companies c
+        LEFT JOIN user_companies uc ON c.id = uc.company_id
+        LEFT JOIN sales s ON c.id = s.company_id
+        WHERE c.id = %s
+        GROUP BY c.id
+    """, (company_id,))
+    company = cur.fetchone()
+    if not company:
+        conn.close()
+        return jsonify({"error": "Company not found"}), 404
+
+    cur.execute("""
+        SELECT u.id, u.username, u.email, u.full_name, uc.role, uc.joined_at
+        FROM user_companies uc
+        JOIN users u ON uc.user_id = u.id
+        WHERE uc.company_id = %s
+        ORDER BY uc.role, u.username
+    """, (company_id,))
+    company['members'] = cur.fetchall()
+    conn.close()
+    return jsonify(company)
+
+@app.route('/api/switch-company', methods=['POST'])
+@login_required
+def switch_company():
+    data = request.json
+    company_id = data.get('company_id')
+
+    if not company_id:
+        return jsonify({"error": "Company ID required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT c.id, c.company_name
+        FROM companies c
+        JOIN user_companies uc ON c.id = uc.company_id
+        WHERE uc.user_id = %s AND c.id = %s
+    """, (session['user_id'], company_id))
+    company = cur.fetchone()
+    conn.close()
+
+    if not company:
+        return jsonify({"error": "Access denied"}), 403
+
+    session['company_id'] = company['id']
+    session['company_name'] = company['company_name']
+
+    return jsonify({
+        "success": True,
+        "company_id": company['id'],
+        "company_name": company['company_name']
+    })
+
+# ==================== SALES & REVENUE ====================
+
+@app.route('/api/revenue/today')
+@login_required
+def today():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total),0) as total,
+            COALESCE(SUM(credit),0) as credit,
+            COALESCE(SUM(total - credit),0) as net,
+            COUNT(*) as transactions
+        FROM sales
+        WHERE sale_date = CURRENT_DATE AND company_id = %s
+    """, (session['company_id'],))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, item, quantity, price, total, credit, sale_date
+        FROM sales
+        WHERE sale_date = CURRENT_DATE AND company_id = %s
+        ORDER BY id DESC
+    """, (session['company_id'],))
+    data['sales'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/revenue/week')
+@login_required
+def week():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total),0) as total,
+            COALESCE(SUM(credit),0) as credit,
+            COALESCE(SUM(total - credit),0) as net,
+            COUNT(*) as transactions
+        FROM sales
+        WHERE sale_date >= CURRENT_DATE - INTERVAL '7 days' AND company_id = %s
+    """, (session['company_id'],))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, item, quantity, price, total, credit, sale_date
+        FROM sales
+        WHERE sale_date >= CURRENT_DATE - INTERVAL '7 days' AND company_id = %s
+        ORDER BY sale_date DESC
+    """, (session['company_id'],))
+    data['sales'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/revenue/month')
+@login_required
+def month():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total),0) as total,
+            COALESCE(SUM(credit),0) as credit,
+            COALESCE(SUM(total - credit),0) as net,
+            COUNT(*) as transactions
+        FROM sales
+        WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE) AND company_id = %s
+    """, (session['company_id'],))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, item, quantity, price, total, credit, sale_date
+        FROM sales
+        WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE) AND company_id = %s
+        ORDER BY sale_date DESC
+    """, (session['company_id'],))
+    data['sales'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/revenue/date')
+@login_required
+def date_revenue():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total),0) as total,
+            COALESCE(SUM(credit),0) as credit,
+            COALESCE(SUM(total - credit),0) as net,
+            COUNT(*) as transactions
+        FROM sales
+        WHERE sale_date = %s AND company_id = %s
+    """, (date, session['company_id']))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, item, quantity, price, total, credit, sale_date
+        FROM sales
+        WHERE sale_date = %s AND company_id = %s
+        ORDER BY id DESC
+    """, (date, session['company_id']))
+    data['sales'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/revenue/date/summary')
+@login_required
+def date_summary():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            item,
+            COUNT(*) as transactions,
+            SUM(quantity) as total_quantity,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales
+        WHERE sale_date = %s AND company_id = %s
+        GROUP BY item
+        ORDER BY total_revenue DESC
+    """, (date, session['company_id']))
+    summary = cur.fetchall()
+    cur.execute("""
+        SELECT
+            COUNT(*) as total_transactions,
+            SUM(quantity) as total_items_sold,
+            SUM(total) as total_revenue,
+            SUM(credit) as total_credit,
+            SUM(total - credit) as net_revenue
+        FROM sales
+        WHERE sale_date = %s AND company_id = %s
+    """, (date, session['company_id']))
+    totals = cur.fetchone()
+    conn.close()
+    return jsonify({
+        "date": date,
+        "summary": summary,
+        "totals": totals
+    })
+
+@app.route('/api/sale', methods=['POST'])
+@login_required
+def add_sale():
+    data = request.json
+    conn = get_db()
+    cur = conn.cursor()
+
+    total = data['quantity'] * data['price']
+    credit = data.get('credit', 0)
+
+    if credit > total:
+        return jsonify({"error": "Credit cannot exceed total amount"}), 400
+
+    cur.execute("""
+        INSERT INTO sales (item, quantity, price, total, credit, sale_date, company_id, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (
+        data['item'],
+        data['quantity'],
+        data['price'],
+        total,
+        credit,
+        data.get('sale_date', datetime.now().strftime("%Y-%m-%d")),
+        session['company_id'],
+        session['user_id']
+    ))
+    sale_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO items (item_name, default_price, usage_count, last_used, company_id)
+        VALUES (%s, %s, 1, CURRENT_DATE, %s)
+        ON CONFLICT (item_name, company_id) DO UPDATE SET
+            usage_count = items.usage_count + 1,
+            default_price = COALESCE(EXCLUDED.default_price, items.default_price),
+            last_used = CURRENT_DATE
+    """, (data['item'], data['price'], session['company_id']))
+
+    if credit > 0:
+        cur.execute("""
+            INSERT INTO credits (sale_id, amount, status, due_date, company_id)
+            VALUES (%s, %s, 'pending', %s, %s)
+        """, (
+            sale_id,
+            credit,
+            data.get('due_date', (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")),
+            session['company_id']
+        ))
+
+    conn.commit()
+    conn.close()
+    return jsonify({
+        "id": sale_id,
+        "total": total,
+        "credit": credit,
+        "net": total - credit
+    })
+
+@app.route('/api/sale/<int:sale_id>', methods=['PUT', 'DELETE'])
+@login_required
+def update_sale(sale_id):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT company_id FROM sales WHERE id = %s", (sale_id,))
+    sale = cur.fetchone()
+    if not sale or sale[0] != session['company_id']:
+        conn.close()
+        return jsonify({"error": "Sale not found or access denied"}), 404
+
+    if request.method == 'DELETE':
+        cur.execute("DELETE FROM credits WHERE sale_id = %s", (sale_id,))
+        cur.execute("DELETE FROM sales WHERE id = %s RETURNING id", (sale_id,))
+        deleted = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if deleted:
+            return jsonify({"status": "deleted"})
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.json
+    total = data['quantity'] * data['price']
+    credit = data.get('credit', 0)
+
+    if credit > total:
+        conn.close()
+        return jsonify({"error": "Credit cannot exceed total amount"}), 400
+
+    cur.execute("""
+        UPDATE sales
+        SET item = %s, quantity = %s, price = %s, total = %s, credit = %s, sale_date = %s
+        WHERE id = %s RETURNING id
+    """, (data['item'], data['quantity'], data['price'], total, credit, data.get('sale_date'), sale_id))
+    updated = cur.fetchone()
+
+    if credit > 0:
+        cur.execute("""
+            INSERT INTO credits (sale_id, amount, status, due_date, company_id)
+            VALUES (%s, %s, 'pending', %s, %s)
+            ON CONFLICT (sale_id) DO UPDATE SET
+                amount = EXCLUDED.amount,
+                due_date = EXCLUDED.due_date,
+                status = 'pending'
+        """, (sale_id, credit, data.get('due_date', (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")), session['company_id']))
+    else:
+        cur.execute("DELETE FROM credits WHERE sale_id = %s", (sale_id,))
+
+    conn.commit()
+    conn.close()
+    if updated:
+        return jsonify({"status": "updated", "id": sale_id, "total": total, "credit": credit})
+    return jsonify({"error": "Not found"}), 404
+
+@app.route('/api/recent')
+@login_required
+def recent():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT id, item, quantity, price, total, credit, sale_date
+        FROM sales
+        WHERE company_id = %s
+        ORDER BY id DESC LIMIT 20
+    """, (session['company_id'],))
+    data = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/items', methods=['GET', 'POST'])
+@login_required
+def items():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    if request.method == 'POST':
+        data = request.json
+        cur.execute("""
+            INSERT INTO items (item_name, default_price, company_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (item_name, company_id) DO UPDATE SET
+                default_price = EXCLUDED.default_price
+        """, (data['item_name'], data.get('default_price', 0), session['company_id']))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "created"})
+
+    cur.execute("""
+        SELECT item_name, default_price, usage_count
+        FROM items
+        WHERE company_id = %s
+        ORDER BY usage_count DESC, last_used DESC LIMIT 100
+    """, (session['company_id'],))
+    data = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+# ==================== CREDIT MANAGEMENT ====================
+
+@app.route('/api/credits/pending')
+@login_required
+def pending_credits():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            c.id, c.sale_id, c.amount, c.due_date, c.status,
+            s.item, s.sale_date, s.company_id,
+            u.username as created_by
+        FROM credits c
+        JOIN sales s ON c.sale_id = s.id
+        LEFT JOIN users u ON s.created_by = u.id
+        WHERE c.status = 'pending' AND c.company_id = %s
+        ORDER BY c.due_date ASC
+    """, (session['company_id'],))
+    credits = cur.fetchall()
+
+    total_pending = sum(credit['amount'] for credit in credits)
+    conn.close()
+    return jsonify({
+        "pending_credits": credits,
+        "total_pending": total_pending
+    })
+
+@app.route('/api/credits/paid')
+@login_required
+def paid_credits():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            c.id, c.sale_id, c.amount, c.paid_date, c.due_date,
+            s.item, s.sale_date,
+            u.username as paid_by
+        FROM credits c
+        JOIN sales s ON c.sale_id = s.id
+        LEFT JOIN users u ON c.paid_by = u.id
+        WHERE c.status = 'paid' AND c.company_id = %s
+        ORDER BY c.paid_date DESC
+        LIMIT 100
+    """, (session['company_id'],))
+    credits = cur.fetchall()
+
+    total_paid = sum(credit['amount'] for credit in credits)
+    conn.close()
+    return jsonify({
+        "paid_credits": credits,
+        "total_paid": total_paid
+    })
+
+@app.route('/api/credits/pay/<int:sale_id>', methods=['POST'])
+@login_required
+def pay_credit(sale_id):
+    data = request.json
+    amount = data.get('amount')
+
+    if not amount or amount <= 0:
+        return jsonify({"error": "Valid amount required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT id, amount, status FROM credits
+        WHERE sale_id = %s AND company_id = %s AND status = 'pending'
+    """, (sale_id, session['company_id']))
+    credit = cur.fetchone()
+
+    if not credit:
+        conn.close()
+        return jsonify({"error": "No pending credit found for this sale"}), 404
+
+    if amount > credit['amount']:
+        conn.close()
+        return jsonify({"error": f"Amount exceeds pending credit of {credit['amount']}"}), 400
+
+    cur.execute("""
+        UPDATE credits
+        SET status = 'paid',
+            paid_date = CURRENT_DATE,
+            paid_by = %s,
+            amount_paid = %s
+        WHERE id = %s
+        RETURNING id
+    """, (session['user_id'], amount, credit['id']))
+
+    cur.execute("""
+        UPDATE sales
+        SET credit = credit - %s
+        WHERE id = %s
+    """, (amount, sale_id))
+
+    remaining_credit = credit['amount'] - amount
+    if remaining_credit <= 0:
+        cur.execute("""
+            UPDATE sales SET credit = 0 WHERE id = %s
+        """, (sale_id,))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "amount_paid": amount,
+        "remaining_credit": remaining_credit if remaining_credit > 0 else 0
+    })
+
+# ==================== EXPENSE MANAGEMENT ====================
+
+@app.route('/api/expenses', methods=['GET', 'POST'])
+@login_required
+def expenses():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    if request.method == 'POST':
+        data = request.json
+        required = ['category', 'amount', 'description']
+        for field in required:
+            if not data.get(field):
+                return jsonify({"error": f"{field} is required"}), 400
+
+        cur.execute("""
+            INSERT INTO expenses (
+                category, amount, description, expense_date,
+                company_id, created_by, payment_method, receipt_number
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            data['category'],
+            data['amount'],
+            data['description'],
+            data.get('expense_date', datetime.now().strftime("%Y-%m-%d")),
+            session['company_id'],
+            session['user_id'],
+            data.get('payment_method', 'cash'),
+            data.get('receipt_number')
+        ))
+        expense_id = cur.fetchone()['id']
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "success": True,
+            "id": expense_id
+        })
+
+    category = request.args.get('category')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    limit = request.args.get('limit', 100, type=int)
+
+    query = """
+        SELECT id, category, amount, description, expense_date,
+               payment_method, receipt_number, created_at
+        FROM expenses
+        WHERE company_id = %s
+    """
+    params = [session['company_id']]
+
+    if category:
+        query += " AND category = %s"
+        params.append(category)
+
+    if start_date:
+        query += " AND expense_date >= %s"
+        params.append(start_date)
+
+    if end_date:
+        query += " AND expense_date <= %s"
+        params.append(end_date)
+
+    query += " ORDER BY expense_date DESC LIMIT %s"
+    params.append(limit)
+
+    cur.execute(query, params)
+    expenses = cur.fetchall()
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as total_expenses,
+            COUNT(*) as expense_count,
+            COALESCE(AVG(amount), 0) as average_expense
+        FROM expenses
+        WHERE company_id = %s
+    """, (session['company_id'],))
+    summary = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            category,
+            COUNT(*) as count,
+            COALESCE(SUM(amount), 0) as total,
+            COALESCE(AVG(amount), 0) as average
+        FROM expenses
+        WHERE company_id = %s
+        GROUP BY category
+        ORDER BY total DESC
+    """, (session['company_id'],))
+    category_summary = cur.fetchall()
+
+    conn.close()
+    return jsonify({
+        "expenses": expenses,
+        "summary": summary,
+        "category_summary": category_summary
+    })
+
+@app.route('/api/expenses/today')
+@login_required
+def expenses_today():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as total,
+            COUNT(*) as count
+        FROM expenses
+        WHERE expense_date = CURRENT_DATE AND company_id = %s
+    """, (session['company_id'],))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, category, amount, description, payment_method
+        FROM expenses
+        WHERE expense_date = CURRENT_DATE AND company_id = %s
+        ORDER BY id DESC
+    """, (session['company_id'],))
+    data['expenses'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/expenses/week')
+@login_required
+def expenses_week():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as total,
+            COUNT(*) as count
+        FROM expenses
+        WHERE expense_date >= CURRENT_DATE - INTERVAL '7 days' AND company_id = %s
+    """, (session['company_id'],))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, category, amount, description, expense_date
+        FROM expenses
+        WHERE expense_date >= CURRENT_DATE - INTERVAL '7 days' AND company_id = %s
+        ORDER BY expense_date DESC
+    """, (session['company_id'],))
+    data['expenses'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/expenses/month')
+@login_required
+def expenses_month():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as total,
+            COUNT(*) as count
+        FROM expenses
+        WHERE expense_date >= DATE_TRUNC('month', CURRENT_DATE) AND company_id = %s
+    """, (session['company_id'],))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, category, amount, description, expense_date
+        FROM expenses
+        WHERE expense_date >= DATE_TRUNC('month', CURRENT_DATE) AND company_id = %s
+        ORDER BY expense_date DESC
+    """, (session['company_id'],))
+    data['expenses'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/expenses/date')
+@login_required
+def expenses_date():
+    date = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as total,
+            COUNT(*) as count
+        FROM expenses
+        WHERE expense_date = %s AND company_id = %s
+    """, (date, session['company_id']))
+    data = cur.fetchone()
+    cur.execute("""
+        SELECT id, category, amount, description, payment_method
+        FROM expenses
+        WHERE expense_date = %s AND company_id = %s
+        ORDER BY id DESC
+    """, (date, session['company_id']))
+    data['expenses'] = cur.fetchall()
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/expense/<int:expense_id>', methods=['PUT', 'DELETE'])
+@login_required
+def update_expense(expense_id):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT company_id FROM expenses WHERE id = %s", (expense_id,))
+    expense = cur.fetchone()
+    if not expense or expense[0] != session['company_id']:
+        conn.close()
+        return jsonify({"error": "Expense not found or access denied"}), 404
+
+    if request.method == 'DELETE':
+        cur.execute("DELETE FROM expenses WHERE id = %s RETURNING id", (expense_id,))
+        deleted = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if deleted:
+            return jsonify({"status": "deleted"})
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.json
+    cur.execute("""
+        UPDATE expenses
+        SET category = %s, amount = %s, description = %s,
+            expense_date = %s, payment_method = %s, receipt_number = %s
+        WHERE id = %s RETURNING id
+    """, (
+        data['category'],
+        data['amount'],
+        data['description'],
+        data.get('expense_date'),
+        data.get('payment_method'),
+        data.get('receipt_number'),
+        expense_id
+    ))
+    updated = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if updated:
+        return jsonify({"status": "updated", "id": expense_id})
+    return jsonify({"error": "Not found"}), 404
+
+# ==================== REPORTS ====================
+
+@app.route('/api/reports/profit-loss')
+@login_required
+def profit_loss():
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    if not start_date:
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    if not end_date:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total), 0) as total_revenue,
+            COALESCE(SUM(credit), 0) as total_credit,
+            COALESCE(SUM(total - credit), 0) as net_revenue,
+            COUNT(*) as transaction_count
+        FROM sales
+        WHERE sale_date BETWEEN %s AND %s AND company_id = %s
+    """, (start_date, end_date, session['company_id']))
+    revenue = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as total_expenses,
+            COUNT(*) as expense_count
+        FROM expenses
+        WHERE expense_date BETWEEN %s AND %s AND company_id = %s
+    """, (start_date, end_date, session['company_id']))
+    expenses = cur.fetchone()
+
+    net_profit = revenue['net_revenue'] - expenses['total_expenses']
+    profit_margin = (net_profit / revenue['total_revenue'] * 100) if revenue['total_revenue'] > 0 else 0
+
+    cur.execute("""
+        SELECT
+            expense_date as date,
+            COALESCE(SUM(amount), 0) as daily_expenses
+        FROM expenses
+        WHERE expense_date BETWEEN %s AND %s AND company_id = %s
+        GROUP BY expense_date
+        ORDER BY expense_date
+    """, (start_date, end_date, session['company_id']))
+    daily_expenses = cur.fetchall()
+
+    cur.execute("""
+        SELECT
+            sale_date as date,
+            COALESCE(SUM(total), 0) as daily_revenue,
+            COALESCE(SUM(credit), 0) as daily_credit
+        FROM sales
+        WHERE sale_date BETWEEN %s AND %s AND company_id = %s
+        GROUP BY sale_date
+        ORDER BY sale_date
+    """, (start_date, end_date, session['company_id']))
+    daily_revenue = cur.fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "period": {
+            "start_date": start_date,
+            "end_date": end_date
+        },
+        "revenue": revenue,
+        "expenses": expenses,
+        "profit": {
+            "net_profit": net_profit,
+            "profit_margin": round(profit_margin, 2)
+        },
+        "daily_data": {
+            "revenue": daily_revenue,
+            "expenses": daily_expenses
+        }
+    })
+
+@app.route('/api/reports/summary')
+@login_required
+def summary_report():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total), 0) as revenue,
+            COALESCE(SUM(credit), 0) as credit,
+            COUNT(*) as sales_count
+        FROM sales
+        WHERE sale_date = CURRENT_DATE AND company_id = %s
+    """, (session['company_id'],))
+    today_sales = cur.fetchone()
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) as expenses
+        FROM expenses
+        WHERE expense_date = CURRENT_DATE AND company_id = %s
+    """, (session['company_id'],))
+    today_expenses = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(total), 0) as revenue,
+            COALESCE(SUM(credit), 0) as credit,
+            COUNT(*) as sales_count
+        FROM sales
+        WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE) AND company_id = %s
+    """, (session['company_id'],))
+    month_sales = cur.fetchone()
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) as expenses
+        FROM expenses
+        WHERE expense_date >= DATE_TRUNC('month', CURRENT_DATE) AND company_id = %s
+    """, (session['company_id'],))
+    month_expenses = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            item,
+            COUNT(*) as sales_count,
+            SUM(quantity) as total_quantity,
+            COALESCE(SUM(total), 0) as total_revenue
+        FROM sales
+        WHERE company_id = %s
+        GROUP BY item
+        ORDER BY total_revenue DESC
+        LIMIT 10
+    """, (session['company_id'],))
+    top_items = cur.fetchall()
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(amount), 0) as pending_credit,
+            COUNT(*) as pending_count
+        FROM credits
+        WHERE status = 'pending' AND company_id = %s
+    """, (session['company_id'],))
+    credit_summary = cur.fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "today": {
+            "revenue": today_sales['revenue'],
+            "credit": today_sales['credit'],
+            "net_revenue": today_sales['revenue'] - today_sales['credit'],
+            "expenses": today_expenses['expenses'],
+            "profit": today_sales['revenue'] - today_sales['credit'] - today_expenses['expenses'],
+            "sales_count": today_sales['sales_count']
+        },
+        "month_to_date": {
+            "revenue": month_sales['revenue'],
+            "credit": month_sales['credit'],
+            "net_revenue": month_sales['revenue'] - month_sales['credit'],
+            "expenses": month_expenses['expenses'],
+            "profit": month_sales['revenue'] - month_sales['credit'] - month_expenses['expenses'],
+            "sales_count": month_sales['sales_count']
+        },
+        "top_items": top_items,
+        "credit_summary": credit_summary
+    })
+
+@app.route('/api/reports/company-performance')
+@login_required
+def company_performance():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT company_id FROM user_companies
+        WHERE user_id = %s AND role = 'admin'
+    """, (session['user_id'],))
+    admin_companies = cur.fetchall()
+
+    if not admin_companies:
+        conn.close()
+        return jsonify({"error": "Admin access required"}), 403
+
+    company_ids = [company['company_id'] for company in admin_companies]
+
+    cur.execute("""
+        SELECT
+            c.id as company_id,
+            c.company_name,
+            COALESCE(SUM(s.total), 0) as total_revenue,
+            COALESCE(SUM(s.credit), 0) as total_credit,
+            COUNT(DISTINCT s.id) as transaction_count,
+            COALESCE(SUM(e.amount), 0) as total_expenses,
+            COUNT(DISTINCT e.id) as expense_count
+        FROM companies c
+        LEFT JOIN sales s ON c.id = s.company_id
+        LEFT JOIN expenses e ON c.id = e.company_id
+        WHERE c.id = ANY(%s)
+        GROUP BY c.id, c.company_name
+        ORDER BY total_revenue DESC
+    """, (company_ids,))
+    performance = cur.fetchall()
+
+    conn.close()
+    return jsonify(performance)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
