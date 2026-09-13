@@ -106,10 +106,11 @@ def check_auth():
             "company_id": session.get('company_id')
         })
     return jsonify({"authenticated": False})
-
 @auth_bp.route('/api/register', methods=['POST'])
 def register():
     try:
+        from werkzeug.security import generate_password_hash
+
         data = request.json
         username = (data.get('username') or '').strip()
         password = data.get('password') or ''
@@ -127,29 +128,26 @@ def register():
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Check if username already taken
         cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         if cur.fetchone():
             conn.close()
             return jsonify({"error": "Username already exists"}), 409
 
-        # Create user
+        # Create user with BOTH password and password_hash
+        pw_hash = generate_password_hash(password)
         cur.execute("""
-            INSERT INTO users (username, password, full_name, email)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO users (username, password, password_hash, full_name, email)
+            VALUES (%s, %s, %s, %s, %s)
             RETURNING id, username, full_name
-        """, (username, password, full_name, email))
+        """, (username, password, pw_hash, full_name, email))
         user = cur.fetchone()
 
-        # Create company for this user
         cur.execute("""
             INSERT INTO companies (company_name, created_by)
-            VALUES (%s, %s)
-            RETURNING id, company_name
+            VALUES (%s, %s) RETURNING id, company_name
         """, (company_name, user['id']))
         company = cur.fetchone()
 
-        # Link user to their company
         cur.execute("""
             INSERT INTO user_companies (user_id, company_id, role)
             VALUES (%s, %s, 'admin')
@@ -158,7 +156,6 @@ def register():
         conn.commit()
         conn.close()
 
-        # Auto-login: set session
         session['user_id'] = user['id']
         session['username'] = user['username']
         session['full_name'] = user.get('full_name') or user['username']
