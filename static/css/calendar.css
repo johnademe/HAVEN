@@ -1,0 +1,30 @@
+/* calendar.css — FullCalendar overrides */
+#calendar .fc-toolbar-title {
+    font-size: 16px;
+    font-weight: 700;
+}
+#calendar .fc-button {
+    font-size: 12px;
+    padding: 6px 12px;
+    font-family: inherit;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+}
+#calendar .fc-button-primary:not(:disabled):active,
+#calendar .fc-button-primary:not(:disabled).fc-button-active {
+    background: var(--blue);
+    border-color: var(--blue);
+    color: white;
+}
+#calendar .fc-daygrid-day-number {
+    font-size: 13px;
+    font-weight: 600;
+}
+#calendar .fc-event {
+    font-size: 11px;
+    border-radius: 6px;
+    padding: 2px 6px;
+    border: none;
+}
